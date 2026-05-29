@@ -19,7 +19,7 @@ class BeszelConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Required(CONF_URL): str,
                 vol.Optional(CONF_USERNAME): str,
                 vol.Optional(CONF_PASSWORD): str,
-                vol.Optional(CONF_UPDATE_INTERVAL, default=30): int,
+                vol.Optional(CONF_UPDATE_INTERVAL, default=120): int,
                 vol.Optional(CONF_VERIFY_SSL, default=True): bool,
             }),
             errors=errors,

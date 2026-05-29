@@ -14,7 +14,7 @@ async def async_setup_entry(hass, entry):
     username = entry.data.get(CONF_USERNAME, None)
     password = entry.data.get(CONF_PASSWORD, None)
     verify_ssl = entry.data.get(CONF_VERIFY_SSL, True)
-    update_interval = entry.data.get(CONF_UPDATE_INTERVAL, 30)
+    update_interval = entry.data.get(CONF_UPDATE_INTERVAL, 120)
     client = BeszelApiClient(url, username, password, verify_ssl)
 
     async def async_update_data():
