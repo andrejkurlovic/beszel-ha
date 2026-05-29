@@ -54,16 +54,16 @@ async def async_setup_entry(hass, entry, async_add_entities):
                 if system_stats and 'bat' in system_stats and isinstance(system_stats['bat'], list):
                     entities.append(BeszelBatterySensor(coordinator, system))
 
-                # Create container sensors
-                system_containers = coordinator.data.get('containers', {}).get(system.id, [])
-                for container in system_containers:
+                # Create container sensors — discovered from container_stats
+                system_container_names = list(coordinator.data.get('container_stats', {}).get(system.id, {}).keys())
+                LOGGER.debug(f"Creating sensors for {len(system_container_names)} containers on {system.name}")
+                for container_name in system_container_names:
                     try:
-                        entities.append(BeszelContainerCPUSensor(coordinator, system, container))
-                        entities.append(BeszelContainerMemorySensor(coordinator, system, container))
-                        entities.append(BeszelContainerNetworkSensor(coordinator, system, container))
-                        LOGGER.debug(f"Created sensors for container {getattr(container, 'name', 'unknown')} on {system.name}")
+                        entities.append(BeszelContainerCPUSensor(coordinator, system.id, container_name))
+                        entities.append(BeszelContainerMemorySensor(coordinator, system.id, container_name))
+                        entities.append(BeszelContainerNetworkSensor(coordinator, system.id, container_name))
                     except Exception as ce:
-                        LOGGER.warning(f"Failed to create sensors for container {getattr(container, 'name', 'unknown')}: {ce}")
+                        LOGGER.warning(f"Failed to create sensors for container {container_name}: {ce}")
 
             except Exception as e:
                 LOGGER.error(f"Failed to create sensors for system {system.name if hasattr(system, 'name') else 'unknown'}: {e}")
@@ -676,38 +676,39 @@ class BeszelDiskTotalSensor(BeszelBaseSensor):
 # ---------------------------------------------------------------------------
 # Container sensors
 # ---------------------------------------------------------------------------
+# Containers are discovered from container_stats (same pattern as system_stats,
+# works for all Beszel agent versions). The containers collection is used only
+# for optional enrichment (image name) when available.
 
 _DOCKER_HEALTH = {0: "none", 1: "starting", 2: "healthy", 3: "unhealthy"}
 
 
 class BeszelContainerBaseSensor(CoordinatorEntity, SensorEntity):
-    """Base for per-container sensors. Each container is its own HA device linked to its host."""
+    """Base for per-container sensors. Container name is the stable key."""
 
-    def __init__(self, coordinator, system, container):
+    def __init__(self, coordinator, system_id, container_name):
         super().__init__(coordinator)
-        self._system_id = system.id
-        self._container_id = container.id
-        self._container_name = getattr(container, 'name', container.id)
+        self._system_id = system_id
+        self._container_name = container_name
 
     @property
-    def _container(self):
-        for c in self.coordinator.data.get('containers', {}).get(self._system_id, []):
-            if c.id == self._container_id:
-                return c
-        return None
-
-    @property
-    def _container_stats(self) -> dict:
+    def _cstats(self) -> dict:
+        """Latest stats dict for this container from container_stats collection."""
         return self.coordinator.data.get('container_stats', {}).get(self._system_id, {}).get(self._container_name, {})
 
     @property
+    def _cmeta(self):
+        """Optional record from containers collection (may be None for older agents)."""
+        return self.coordinator.data.get('containers_meta', {}).get(self._system_id, {}).get(self._container_name)
+
+    @property
     def available(self):
-        return self._container is not None
+        return bool(self._cstats)
 
     @property
     def device_info(self):
-        c = self._container
-        image = getattr(c, 'image', None) if c else None
+        meta = self._cmeta
+        image = getattr(meta, 'image', None) if meta else None
         return {
             "identifiers": {(DOMAIN, f"{self._system_id}_container_{self._container_name}")},
             "name": self._container_name,
@@ -732,10 +733,7 @@ class BeszelContainerCPUSensor(BeszelContainerBaseSensor):
 
     @property
     def native_value(self):
-        c = self._container
-        if c is None:
-            return None
-        val = getattr(c, 'cpu', None)
+        val = self._cstats.get('c')
         return round(float(val), 2) if val is not None else None
 
     @property
@@ -748,13 +746,13 @@ class BeszelContainerCPUSensor(BeszelContainerBaseSensor):
 
     @property
     def extra_state_attributes(self):
-        c = self._container
-        if c is None:
+        meta = self._cmeta
+        if meta is None:
             return {}
         return {
-            "status": getattr(c, 'status', None),
-            "health": _DOCKER_HEALTH.get(getattr(c, 'health', 0), "unknown"),
-            "image": getattr(c, 'image', None),
+            "status": getattr(meta, 'status', None),
+            "health": _DOCKER_HEALTH.get(getattr(meta, 'health', 0), "unknown"),
+            "image": getattr(meta, 'image', None),
         }
 
 
@@ -773,10 +771,7 @@ class BeszelContainerMemorySensor(BeszelContainerBaseSensor):
 
     @property
     def native_value(self):
-        c = self._container
-        if c is None:
-            return None
-        val = getattr(c, 'memory', None)
+        val = self._cstats.get('m')
         return round(float(val), 2) if val is not None else None
 
     @property
@@ -793,10 +788,11 @@ class BeszelContainerMemorySensor(BeszelContainerBaseSensor):
 
 
 class BeszelContainerNetworkSensor(BeszelContainerBaseSensor):
-    """Network bytes sent+received in the last polling interval (from containers.net).
+    """Network bytes transferred in the last polling interval.
 
-    Per-direction breakdown (sent_mb, recv_mb) is added as attributes when
-    container_stats data is available (b[0]=sent bytes, b[1]=recv bytes).
+    Uses b[0]+b[1] (sent+recv bytes) from container_stats.
+    Per-direction breakdown available as sent_mb / recv_mb attributes.
+    Falls back to deprecated ns/nr fields for older Beszel agents.
     """
 
     @property
@@ -813,13 +809,17 @@ class BeszelContainerNetworkSensor(BeszelContainerBaseSensor):
 
     @property
     def native_value(self):
-        c = self._container
-        if c is None:
-            return None
-        net_bytes = getattr(c, 'net', None)
-        if net_bytes is None:
-            return None
-        return round(int(net_bytes) / (1024 * 1024), 4)
+        stats = self._cstats
+        bandwidth = stats.get('b')
+        if bandwidth and len(bandwidth) >= 2:
+            total_bytes = bandwidth[0] + bandwidth[1]
+            return round(total_bytes / (1024 * 1024), 4)
+        # Fall back to deprecated per-direction MB fields
+        ns = stats.get('ns', 0) or 0
+        nr = stats.get('nr', 0) or 0
+        if ns or nr:
+            return round(float(ns) + float(nr), 4)
+        return None
 
     @property
     def device_class(self):
@@ -835,9 +835,7 @@ class BeszelContainerNetworkSensor(BeszelContainerBaseSensor):
 
     @property
     def extra_state_attributes(self):
-        stats = self._container_stats
-        if not stats:
-            return {}
+        stats = self._cstats
         bandwidth = stats.get('b')
         if bandwidth and len(bandwidth) >= 2:
             return {

@@ -67,39 +67,45 @@ async def async_setup_entry(hass, entry):
             except Exception as e:
                 LOGGER.warning(f"Failed to fetch S.M.A.R.T. devices: {e}")
 
-            # Fetch containers and latest container stats for each system
-            containers_data = {}
+            # Fetch container stats and optional metadata for each system.
+            # container_stats is the primary discovery source — it works even for older
+            # Beszel agents that don't populate the containers collection.
             container_stats_data = {}
+            containers_meta = {}
             for system in systems:
-                try:
-                    containers = await hass.async_add_executor_job(client.get_containers, system.id)
-                    containers_data[system.id] = containers
-                    LOGGER.debug(f"Loaded {len(containers)} containers for system {system.id}")
-                except Exception as e:
-                    LOGGER.warning(f"Failed to fetch containers for system {system.id}: {e}")
-                    containers_data[system.id] = []
-
+                # Primary: container_stats — same pattern as system_stats, always populated
                 try:
                     cstats_record = await hass.async_add_executor_job(client.get_container_stats, system.id)
                     if cstats_record:
-                        # stats is a list of dicts: {n, c, m, b:[sent,recv], ...}
                         raw = cstats_record.stats if hasattr(cstats_record, 'stats') else []
-                        # index by container name for O(1) lookup in entities
                         container_stats_data[system.id] = {
                             item.get('n'): item for item in (raw or []) if item.get('n')
                         }
+                        LOGGER.debug(f"Loaded {len(container_stats_data[system.id])} containers via container_stats for system {system.id}")
                     else:
                         container_stats_data[system.id] = {}
                 except Exception as e:
-                    LOGGER.warning(f"Failed to fetch container stats for system {system.id}: {e}")
+                    LOGGER.warning(f"Failed to fetch container_stats for system {system.id}: {e}")
                     container_stats_data[system.id] = {}
+
+                # Optional: containers collection — only populated for Beszel agents >= 0.9
+                # that send container IDs. Used for status, health, and image metadata.
+                try:
+                    containers = await hass.async_add_executor_job(client.get_containers, system.id)
+                    containers_meta[system.id] = {
+                        getattr(c, 'name', ''): c for c in containers if getattr(c, 'name', '')
+                    }
+                    LOGGER.debug(f"Loaded {len(containers_meta[system.id])} entries from containers collection for system {system.id}")
+                except Exception as e:
+                    LOGGER.debug(f"containers collection unavailable for system {system.id}: {e}")
+                    containers_meta[system.id] = {}
 
             return {
                 "systems": systems,
                 "stats": stats_data,
                 "smart_devices": smart_devices,
-                "containers": containers_data,
                 "container_stats": container_stats_data,
+                "containers_meta": containers_meta,
             }
         except Exception as err:
             LOGGER.error(f"Error fetching systems: {err}")

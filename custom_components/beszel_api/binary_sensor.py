@@ -26,18 +26,17 @@ async def async_setup_entry(hass, entry, async_add_entities):
                     entities.append(BeszelSmartBinarySensor(coordinator, system, device))
                     LOGGER.info(f"Created S.M.A.R.T. sensor for {system.name} - {device.get('name', 'unknown')}")
 
-                # Create container binary sensors (status + health)
-                system_containers = coordinator.data.get('containers', {}).get(system.id, [])
-                for container in system_containers:
+                # Create container binary sensors — discovered from container_stats
+                system_container_names = list(coordinator.data.get('container_stats', {}).get(system.id, {}).keys())
+                for container_name in system_container_names:
                     try:
-                        entities.append(BeszelContainerStatusBinarySensor(coordinator, system, container))
-                        # Only add health sensor if the container has a healthcheck configured
-                        health = getattr(container, 'health', 0)
-                        if health != 0:
-                            entities.append(BeszelContainerHealthBinarySensor(coordinator, system, container))
-                        LOGGER.debug(f"Created binary sensors for container {getattr(container, 'name', 'unknown')} on {system.name}")
+                        entities.append(BeszelContainerStatusBinarySensor(coordinator, system.id, container_name))
+                        # Health sensor only if containers_meta has a health value for this container
+                        meta = coordinator.data.get('containers_meta', {}).get(system.id, {}).get(container_name)
+                        if meta and getattr(meta, 'health', 0) != 0:
+                            entities.append(BeszelContainerHealthBinarySensor(coordinator, system.id, container_name))
                     except Exception as ce:
-                        LOGGER.warning(f"Failed to create binary sensors for container {getattr(container, 'name', 'unknown')}: {ce}")
+                        LOGGER.warning(f"Failed to create binary sensors for container {container_name}: {ce}")
 
             except Exception as e:
                 LOGGER.error(f"Failed to create binary sensors for system {system.name if hasattr(system, 'name') else 'unknown'}: {e}")
@@ -225,6 +224,8 @@ class BeszelSmartBinarySensor(BeszelBaseBinarySensor):
 # ---------------------------------------------------------------------------
 # Container binary sensors
 # ---------------------------------------------------------------------------
+# Containers are discovered from container_stats, same as the sensor platform.
+# The containers collection (containers_meta) is only used for optional enrichment.
 
 _DOCKER_HEALTH = {0: "none", 1: "starting", 2: "healthy", 3: "unhealthy"}
 
@@ -232,27 +233,27 @@ _DOCKER_HEALTH = {0: "none", 1: "starting", 2: "healthy", 3: "unhealthy"}
 class BeszelContainerBaseBinarySensor(CoordinatorEntity, BinarySensorEntity):
     """Base for per-container binary sensors."""
 
-    def __init__(self, coordinator, system, container):
+    def __init__(self, coordinator, system_id, container_name):
         super().__init__(coordinator)
-        self._system_id = system.id
-        self._container_id = container.id
-        self._container_name = getattr(container, 'name', container.id)
+        self._system_id = system_id
+        self._container_name = container_name
 
     @property
-    def _container(self):
-        for c in self.coordinator.data.get('containers', {}).get(self._system_id, []):
-            if c.id == self._container_id:
-                return c
-        return None
+    def _cstats(self) -> dict:
+        return self.coordinator.data.get('container_stats', {}).get(self._system_id, {}).get(self._container_name, {})
+
+    @property
+    def _cmeta(self):
+        return self.coordinator.data.get('containers_meta', {}).get(self._system_id, {}).get(self._container_name)
 
     @property
     def available(self):
-        return self._container is not None
+        return bool(self._cstats)
 
     @property
     def device_info(self):
-        c = self._container
-        image = getattr(c, 'image', None) if c else None
+        meta = self._cmeta
+        image = getattr(meta, 'image', None) if meta else None
         return {
             "identifiers": {(DOMAIN, f"{self._system_id}_container_{self._container_name}")},
             "name": self._container_name,
@@ -263,7 +264,11 @@ class BeszelContainerBaseBinarySensor(CoordinatorEntity, BinarySensorEntity):
 
 
 class BeszelContainerStatusBinarySensor(BeszelContainerBaseBinarySensor):
-    """True when the container is running."""
+    """True when the container is running.
+
+    Prefers containers_meta status field; falls back to presence in container_stats
+    (if a container is reporting stats, it was running in the last poll window).
+    """
 
     @property
     def unique_id(self):
@@ -275,8 +280,11 @@ class BeszelContainerStatusBinarySensor(BeszelContainerBaseBinarySensor):
 
     @property
     def is_on(self):
-        c = self._container
-        return getattr(c, 'status', '') == 'running' if c else False
+        meta = self._cmeta
+        if meta is not None:
+            return getattr(meta, 'status', '') == 'running'
+        # Fall back: presence of stats means the container was active last poll
+        return bool(self._cstats)
 
     @property
     def device_class(self):
@@ -284,17 +292,17 @@ class BeszelContainerStatusBinarySensor(BeszelContainerBaseBinarySensor):
 
     @property
     def extra_state_attributes(self):
-        c = self._container
-        if c is None:
+        meta = self._cmeta
+        if meta is None:
             return {}
         return {
-            "status": getattr(c, 'status', None),
-            "image": getattr(c, 'image', None),
+            "status": getattr(meta, 'status', None),
+            "image": getattr(meta, 'image', None),
         }
 
 
 class BeszelContainerHealthBinarySensor(BeszelContainerBaseBinarySensor):
-    """True (= problem) when the container health check reports unhealthy."""
+    """True (= problem) when health check is unhealthy. Only created when containers_meta is available."""
 
     @property
     def unique_id(self):
@@ -306,9 +314,8 @@ class BeszelContainerHealthBinarySensor(BeszelContainerBaseBinarySensor):
 
     @property
     def is_on(self):
-        """Return True when health check fails (unhealthy = 3)."""
-        c = self._container
-        return getattr(c, 'health', 0) == 3 if c else False
+        meta = self._cmeta
+        return getattr(meta, 'health', 0) == 3 if meta else False
 
     @property
     def device_class(self):
@@ -316,15 +323,15 @@ class BeszelContainerHealthBinarySensor(BeszelContainerBaseBinarySensor):
 
     @property
     def icon(self):
-        c = self._container
-        health = getattr(c, 'health', 0) if c else 0
+        meta = self._cmeta
+        health = getattr(meta, 'health', 0) if meta else 0
         return "mdi:alert-circle" if health == 3 else "mdi:check-circle"
 
     @property
     def extra_state_attributes(self):
-        c = self._container
-        if c is None:
+        meta = self._cmeta
+        if meta is None:
             return {}
         return {
-            "health_state": _DOCKER_HEALTH.get(getattr(c, 'health', 0), "unknown"),
+            "health_state": _DOCKER_HEALTH.get(getattr(meta, 'health', 0), "unknown"),
         }
