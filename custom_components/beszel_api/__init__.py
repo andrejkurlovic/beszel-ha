@@ -67,7 +67,40 @@ async def async_setup_entry(hass, entry):
             except Exception as e:
                 LOGGER.warning(f"Failed to fetch S.M.A.R.T. devices: {e}")
 
-            return {"systems": systems, "stats": stats_data, "smart_devices": smart_devices}
+            # Fetch containers and latest container stats for each system
+            containers_data = {}
+            container_stats_data = {}
+            for system in systems:
+                try:
+                    containers = await hass.async_add_executor_job(client.get_containers, system.id)
+                    containers_data[system.id] = containers
+                    LOGGER.debug(f"Loaded {len(containers)} containers for system {system.id}")
+                except Exception as e:
+                    LOGGER.warning(f"Failed to fetch containers for system {system.id}: {e}")
+                    containers_data[system.id] = []
+
+                try:
+                    cstats_record = await hass.async_add_executor_job(client.get_container_stats, system.id)
+                    if cstats_record:
+                        # stats is a list of dicts: {n, c, m, b:[sent,recv], ...}
+                        raw = cstats_record.stats if hasattr(cstats_record, 'stats') else []
+                        # index by container name for O(1) lookup in entities
+                        container_stats_data[system.id] = {
+                            item.get('n'): item for item in (raw or []) if item.get('n')
+                        }
+                    else:
+                        container_stats_data[system.id] = {}
+                except Exception as e:
+                    LOGGER.warning(f"Failed to fetch container stats for system {system.id}: {e}")
+                    container_stats_data[system.id] = {}
+
+            return {
+                "systems": systems,
+                "stats": stats_data,
+                "smart_devices": smart_devices,
+                "containers": containers_data,
+                "container_stats": container_stats_data,
+            }
         except Exception as err:
             LOGGER.error(f"Error fetching systems: {err}")
             raise UpdateFailed(f"Error fetching systems: {err}")

@@ -54,6 +54,17 @@ async def async_setup_entry(hass, entry, async_add_entities):
                 if system_stats and 'bat' in system_stats and isinstance(system_stats['bat'], list):
                     entities.append(BeszelBatterySensor(coordinator, system))
 
+                # Create container sensors
+                system_containers = coordinator.data.get('containers', {}).get(system.id, [])
+                for container in system_containers:
+                    try:
+                        entities.append(BeszelContainerCPUSensor(coordinator, system, container))
+                        entities.append(BeszelContainerMemorySensor(coordinator, system, container))
+                        entities.append(BeszelContainerNetworkSensor(coordinator, system, container))
+                        LOGGER.debug(f"Created sensors for container {getattr(container, 'name', 'unknown')} on {system.name}")
+                    except Exception as ce:
+                        LOGGER.warning(f"Failed to create sensors for container {getattr(container, 'name', 'unknown')}: {ce}")
+
             except Exception as e:
                 LOGGER.error(f"Failed to create sensors for system {system.name if hasattr(system, 'name') else 'unknown'}: {e}")
                 continue
@@ -660,3 +671,184 @@ class BeszelDiskTotalSensor(BeszelBaseSensor):
     @property
     def state_class(self):
         return SensorStateClass.MEASUREMENT
+
+
+# ---------------------------------------------------------------------------
+# Container sensors
+# ---------------------------------------------------------------------------
+
+_DOCKER_HEALTH = {0: "none", 1: "starting", 2: "healthy", 3: "unhealthy"}
+
+
+class BeszelContainerBaseSensor(CoordinatorEntity, SensorEntity):
+    """Base for per-container sensors. Each container is its own HA device linked to its host."""
+
+    def __init__(self, coordinator, system, container):
+        super().__init__(coordinator)
+        self._system_id = system.id
+        self._container_id = container.id
+        self._container_name = getattr(container, 'name', container.id)
+
+    @property
+    def _container(self):
+        for c in self.coordinator.data.get('containers', {}).get(self._system_id, []):
+            if c.id == self._container_id:
+                return c
+        return None
+
+    @property
+    def _container_stats(self) -> dict:
+        return self.coordinator.data.get('container_stats', {}).get(self._system_id, {}).get(self._container_name, {})
+
+    @property
+    def available(self):
+        return self._container is not None
+
+    @property
+    def device_info(self):
+        c = self._container
+        image = getattr(c, 'image', None) if c else None
+        return {
+            "identifiers": {(DOMAIN, f"{self._system_id}_container_{self._container_name}")},
+            "name": self._container_name,
+            "manufacturer": "Docker / Podman",
+            "model": image,
+            "via_device": (DOMAIN, self._system_id),
+        }
+
+
+class BeszelContainerCPUSensor(BeszelContainerBaseSensor):
+    @property
+    def unique_id(self):
+        return f"beszel_{self._system_id}_container_{self._container_name}_cpu"
+
+    @property
+    def name(self):
+        return f"{self._container_name} CPU"
+
+    @property
+    def icon(self):
+        return "mdi:memory"
+
+    @property
+    def native_value(self):
+        c = self._container
+        if c is None:
+            return None
+        val = getattr(c, 'cpu', None)
+        return round(float(val), 2) if val is not None else None
+
+    @property
+    def native_unit_of_measurement(self):
+        return "%"
+
+    @property
+    def state_class(self):
+        return SensorStateClass.MEASUREMENT
+
+    @property
+    def extra_state_attributes(self):
+        c = self._container
+        if c is None:
+            return {}
+        return {
+            "status": getattr(c, 'status', None),
+            "health": _DOCKER_HEALTH.get(getattr(c, 'health', 0), "unknown"),
+            "image": getattr(c, 'image', None),
+        }
+
+
+class BeszelContainerMemorySensor(BeszelContainerBaseSensor):
+    @property
+    def unique_id(self):
+        return f"beszel_{self._system_id}_container_{self._container_name}_memory"
+
+    @property
+    def name(self):
+        return f"{self._container_name} Memory"
+
+    @property
+    def icon(self):
+        return "mdi:chip"
+
+    @property
+    def native_value(self):
+        c = self._container
+        if c is None:
+            return None
+        val = getattr(c, 'memory', None)
+        return round(float(val), 2) if val is not None else None
+
+    @property
+    def device_class(self):
+        return SensorDeviceClass.DATA_SIZE
+
+    @property
+    def native_unit_of_measurement(self):
+        return "MB"
+
+    @property
+    def state_class(self):
+        return SensorStateClass.MEASUREMENT
+
+
+class BeszelContainerNetworkSensor(BeszelContainerBaseSensor):
+    """Network bytes sent+received in the last polling interval (from containers.net).
+
+    Per-direction breakdown (sent_mb, recv_mb) is added as attributes when
+    container_stats data is available (b[0]=sent bytes, b[1]=recv bytes).
+    """
+
+    @property
+    def unique_id(self):
+        return f"beszel_{self._system_id}_container_{self._container_name}_network"
+
+    @property
+    def name(self):
+        return f"{self._container_name} Network"
+
+    @property
+    def icon(self):
+        return "mdi:swap-horizontal"
+
+    @property
+    def native_value(self):
+        c = self._container
+        if c is None:
+            return None
+        net_bytes = getattr(c, 'net', None)
+        if net_bytes is None:
+            return None
+        return round(int(net_bytes) / (1024 * 1024), 4)
+
+    @property
+    def device_class(self):
+        return SensorDeviceClass.DATA_SIZE
+
+    @property
+    def native_unit_of_measurement(self):
+        return "MB"
+
+    @property
+    def state_class(self):
+        return SensorStateClass.MEASUREMENT
+
+    @property
+    def extra_state_attributes(self):
+        stats = self._container_stats
+        if not stats:
+            return {}
+        bandwidth = stats.get('b')
+        if bandwidth and len(bandwidth) >= 2:
+            return {
+                "sent_mb": round(bandwidth[0] / (1024 * 1024), 4),
+                "recv_mb": round(bandwidth[1] / (1024 * 1024), 4),
+            }
+        attrs = {}
+        ns = stats.get('ns')
+        nr = stats.get('nr')
+        if ns is not None:
+            attrs['sent_mb'] = round(float(ns), 4)
+        if nr is not None:
+            attrs['recv_mb'] = round(float(nr), 4)
+        return attrs

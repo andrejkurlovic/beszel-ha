@@ -26,6 +26,19 @@ async def async_setup_entry(hass, entry, async_add_entities):
                     entities.append(BeszelSmartBinarySensor(coordinator, system, device))
                     LOGGER.info(f"Created S.M.A.R.T. sensor for {system.name} - {device.get('name', 'unknown')}")
 
+                # Create container binary sensors (status + health)
+                system_containers = coordinator.data.get('containers', {}).get(system.id, [])
+                for container in system_containers:
+                    try:
+                        entities.append(BeszelContainerStatusBinarySensor(coordinator, system, container))
+                        # Only add health sensor if the container has a healthcheck configured
+                        health = getattr(container, 'health', 0)
+                        if health != 0:
+                            entities.append(BeszelContainerHealthBinarySensor(coordinator, system, container))
+                        LOGGER.debug(f"Created binary sensors for container {getattr(container, 'name', 'unknown')} on {system.name}")
+                    except Exception as ce:
+                        LOGGER.warning(f"Failed to create binary sensors for container {getattr(container, 'name', 'unknown')}: {ce}")
+
             except Exception as e:
                 LOGGER.error(f"Failed to create binary sensors for system {system.name if hasattr(system, 'name') else 'unknown'}: {e}")
                 continue
@@ -207,3 +220,111 @@ class BeszelSmartBinarySensor(BeszelBaseBinarySensor):
         attributes['health_state'] = state
 
         return attributes
+
+
+# ---------------------------------------------------------------------------
+# Container binary sensors
+# ---------------------------------------------------------------------------
+
+_DOCKER_HEALTH = {0: "none", 1: "starting", 2: "healthy", 3: "unhealthy"}
+
+
+class BeszelContainerBaseBinarySensor(CoordinatorEntity, BinarySensorEntity):
+    """Base for per-container binary sensors."""
+
+    def __init__(self, coordinator, system, container):
+        super().__init__(coordinator)
+        self._system_id = system.id
+        self._container_id = container.id
+        self._container_name = getattr(container, 'name', container.id)
+
+    @property
+    def _container(self):
+        for c in self.coordinator.data.get('containers', {}).get(self._system_id, []):
+            if c.id == self._container_id:
+                return c
+        return None
+
+    @property
+    def available(self):
+        return self._container is not None
+
+    @property
+    def device_info(self):
+        c = self._container
+        image = getattr(c, 'image', None) if c else None
+        return {
+            "identifiers": {(DOMAIN, f"{self._system_id}_container_{self._container_name}")},
+            "name": self._container_name,
+            "manufacturer": "Docker / Podman",
+            "model": image,
+            "via_device": (DOMAIN, self._system_id),
+        }
+
+
+class BeszelContainerStatusBinarySensor(BeszelContainerBaseBinarySensor):
+    """True when the container is running."""
+
+    @property
+    def unique_id(self):
+        return f"beszel_{self._system_id}_container_{self._container_name}_status"
+
+    @property
+    def name(self):
+        return f"{self._container_name} Running"
+
+    @property
+    def is_on(self):
+        c = self._container
+        return getattr(c, 'status', '') == 'running' if c else False
+
+    @property
+    def device_class(self):
+        return BinarySensorDeviceClass.RUNNING
+
+    @property
+    def extra_state_attributes(self):
+        c = self._container
+        if c is None:
+            return {}
+        return {
+            "status": getattr(c, 'status', None),
+            "image": getattr(c, 'image', None),
+        }
+
+
+class BeszelContainerHealthBinarySensor(BeszelContainerBaseBinarySensor):
+    """True (= problem) when the container health check reports unhealthy."""
+
+    @property
+    def unique_id(self):
+        return f"beszel_{self._system_id}_container_{self._container_name}_health"
+
+    @property
+    def name(self):
+        return f"{self._container_name} Health"
+
+    @property
+    def is_on(self):
+        """Return True when health check fails (unhealthy = 3)."""
+        c = self._container
+        return getattr(c, 'health', 0) == 3 if c else False
+
+    @property
+    def device_class(self):
+        return BinarySensorDeviceClass.PROBLEM
+
+    @property
+    def icon(self):
+        c = self._container
+        health = getattr(c, 'health', 0) if c else 0
+        return "mdi:alert-circle" if health == 3 else "mdi:check-circle"
+
+    @property
+    def extra_state_attributes(self):
+        c = self._container
+        if c is None:
+            return {}
+        return {
+            "health_state": _DOCKER_HEALTH.get(getattr(c, 'health', 0), "unknown"),
+        }

@@ -59,6 +59,32 @@ class BeszelApiClient:
             # Return None if no stats found or error occurs
             return None
 
+    def get_containers(self, system_id):
+        """Get all containers for a system from the persistent containers collection."""
+        try:
+            self._ensure_client()
+            records = self._client.collection("containers").get_full_list(
+                query_params={"filter": f"system = '{system_id}'", "sort": "name"}
+            )
+            return records
+        except Exception as e:
+            LOGGER.error(f"Failed to fetch containers for system {system_id}: {e}")
+            return []
+
+    def get_container_stats(self, system_id):
+        """Get the latest container_stats record for a system (array of per-container stats)."""
+        try:
+            self._ensure_client()
+            records = self._client.collection("container_stats").get_list(
+                1, 1, {"filter": f"system = '{system_id}' && type = '1m'", "sort": "-created"}
+            )
+            if records.items:
+                return records.items[0]
+            return None
+        except Exception as e:
+            LOGGER.error(f"Failed to fetch container stats for system {system_id}: {e}")
+            return None
+
     def get_smart_devices(self, system_id=None):
         """Get S.M.A.R.T. data for disks"""
         try:
