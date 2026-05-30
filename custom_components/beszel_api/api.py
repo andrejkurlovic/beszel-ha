@@ -63,10 +63,10 @@ class BeszelApiClient:
         """Get all containers for a system from the persistent containers collection."""
         try:
             self._ensure_client()
-            records = self._client.collection("containers").get_full_list(
-                query_params={"filter": f"system = '{system_id}'", "sort": "name"}
+            records = self._client.collection("containers").get_list(
+                1, 500, {"filter": f"system = '{system_id}'", "sort": "name"}
             )
-            return records
+            return records.items if records else []
         except Exception as e:
             LOGGER.error(f"Failed to fetch containers for system {system_id}: {e}")
             return []
@@ -89,15 +89,11 @@ class BeszelApiClient:
         """Get S.M.A.R.T. data for disks"""
         try:
             self._ensure_client()
-            if system_id:
-                # Get devices for specific system
-                records = self._client.collection("smart_devices").get_full_list(
-                    query_params={"filter": f"system = '{system_id}'"}
-                )
-            else:
-                # Get all devices
-                records = self._client.collection("smart_devices").get_full_list()
-            return records
+            filter_str = f"system = '{system_id}'" if system_id else ""
+            records = self._client.collection("smart_devices").get_list(
+                1, 500, {"filter": filter_str} if filter_str else {}
+            )
+            return records.items if records else []
         except Exception as e:
             LOGGER.error(f"Failed to fetch S.M.A.R.T. devices: {e}")
             return []
