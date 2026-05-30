@@ -25,6 +25,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
                 entities.append(BeszelRAMTotalSensor(coordinator, system))
                 entities.append(BeszelDiskSensor(coordinator, system))
                 entities.append(BeszelDiskTotalSensor(coordinator, system))
+                entities.append(BeszelDiskFreeSensor(coordinator, system))
                 entities.append(BeszelBandwidthSensor(coordinator, system))
                 entities.append(BeszelNetworkReceiveSensor(coordinator, system))
                 entities.append(BeszelNetworkSendSensor(coordinator, system))
@@ -445,7 +446,7 @@ class BeszelTemperatureSensor(BeszelBaseSensor):
 
     @property
     def native_unit_of_measurement(self):
-        return "°C"
+        return self.coordinator.data.get("temperature_unit", "°C")
 
     @property
     def state_class(self):
@@ -453,13 +454,8 @@ class BeszelTemperatureSensor(BeszelBaseSensor):
 
     @property
     def extra_state_attributes(self):
-        temperatures = self.stats_data.get("t")
-
-        attributes = {}
-        for key, value in temperatures.items():
-            attributes[f"temperature_{key}"] = value
-
-        return attributes
+        temperatures = self.stats_data.get("t") or {}
+        return {f"temperature_{k}": v for k, v in temperatures.items()}
 
 
 class BeszelUptimeSensor(BeszelBaseSensor):
@@ -569,9 +565,10 @@ class BeszelBatterySensor(BeszelBaseSensor):
 
     @property
     def icon(self):
-        if not self.stats_data and "bat" not in self.stats_data:
+        bat = self.stats_data.get("bat") if self.stats_data else None
+        if not bat or len(bat) < 2:
             return "mdi:battery-unknown"
-        level, state = self.stats_data.get("bat")
+        level, state = bat
         # https://github.com/henrygd/beszel/blob/4d05bfdff0ec90b68e820ad5dc32a5c4bccf8f0f/internal/site/src/lib/enums.ts#L41-L48
         charging = state == 3
 
@@ -659,6 +656,44 @@ class BeszelDiskTotalSensor(BeszelBaseSensor):
             return None
 
         return self.stats_data.get("d")
+
+    @property
+    def device_class(self):
+        return SensorDeviceClass.DATA_SIZE
+
+    @property
+    def native_unit_of_measurement(self):
+        return "GB"
+
+    @property
+    def state_class(self):
+        return SensorStateClass.MEASUREMENT
+
+
+class BeszelDiskFreeSensor(BeszelBaseSensor):
+    @property
+    def unique_id(self):
+        return f"beszel_{self._system_id}_disk_free"
+
+    @property
+    def name(self):
+        return f"{self.system.name} Disk Free" if self.system else None
+
+    @property
+    def icon(self):
+        return "mdi:harddisk"
+
+    @property
+    def available(self):
+        return bool(self.stats_data and
+                    self.stats_data.get("d") is not None and
+                    self.stats_data.get("du") is not None)
+
+    @property
+    def native_value(self):
+        if not self.available:
+            return None
+        return round(self.stats_data["d"] - self.stats_data["du"], 2)
 
     @property
     def device_class(self):

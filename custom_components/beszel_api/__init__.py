@@ -2,7 +2,7 @@ import asyncio
 from datetime import timedelta
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.config_entries import ConfigEntry
-from .const import DOMAIN, CONF_URL, CONF_USERNAME, CONF_PASSWORD, CONF_VERIFY_SSL, CONF_UPDATE_INTERVAL, LOGGER
+from .const import DOMAIN, CONF_URL, CONF_USERNAME, CONF_PASSWORD, CONF_VERIFY_SSL, CONF_UPDATE_INTERVAL, CONF_TEMPERATURE_UNIT, LOGGER
 from .api import BeszelApiClient, BeszelUpdateApi
 
 PLATFORMS = ["sensor", "binary_sensor", "update"]
@@ -106,6 +106,7 @@ async def async_setup_entry(hass, entry):
                 "smart_devices": smart_devices,
                 "container_stats": container_stats_data,
                 "containers_meta": containers_meta,
+                "temperature_unit": entry.data.get(CONF_TEMPERATURE_UNIT, "°C"),
             }
         except Exception as err:
             LOGGER.error(f"Error fetching systems: {err}")
